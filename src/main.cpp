@@ -1,6 +1,7 @@
 #include "pcap_reader.h"
 #include "packet_parser.h"
 #include "sni_extractor.h"
+#include "traffic_stats.h"
 #include <iostream>
 
 int main(int argc, char* argv[]) {
@@ -14,19 +15,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    TrafficStats stats;
     RawPacket packet;
     int count = 0;
+
     while (reader.readNextPacket(packet)) {
         count++;
         ParsedPacket parsed = PacketParser::parse(packet.data);
 
         std::cout << "--- Packet #" << count << " (" << packet.captured_len << " bytes) ---\n";
-
-        if (parsed.has_ethernet) {
-            std::cout << "  Ethernet: " << PacketParser::macToString(parsed.eth.src_mac)
-                      << " -> " << PacketParser::macToString(parsed.eth.dst_mac)
-                      << "  type=0x" << std::hex << parsed.eth.ether_type << std::dec << "\n";
-        }
 
         if (parsed.has_ip) {
             std::cout << "  IP: " << PacketParser::ipToString(parsed.ip.src_ip)
@@ -34,24 +31,29 @@ int main(int argc, char* argv[]) {
                       << "  protocol=" << static_cast<int>(parsed.ip.protocol) << "\n";
         }
 
+        std::string sni;
         if (parsed.has_tcp) {
             std::cout << "  TCP: port " << parsed.tcp.src_port
                       << " -> port " << parsed.tcp.dst_port << "\n";
 
-            // Payload is whatever comes after all the headers we parsed.
             if (parsed.payload_offset < packet.data.size()) {
                 std::vector<uint8_t> payload(
                     packet.data.begin() + parsed.payload_offset,
                     packet.data.end()
                 );
-                std::string sni = SniExtractor::extract(payload);
+                sni = SniExtractor::extract(payload);
                 if (!sni.empty()) {
                     std::cout << "  TLS SNI (domain): " << sni << "\n";
                 }
             }
         }
+
+        if (parsed.has_ip) {
+            stats.recordPacket(parsed.ip.dst_ip, parsed.ip.protocol, sni);
+        }
     }
 
     std::cout << "\nTotal packets read: " << count << "\n";
+    stats.printSummary();
     return 0;
 }
