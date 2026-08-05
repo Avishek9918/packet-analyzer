@@ -3,9 +3,85 @@
 #include "sni_extractor.h"
 #include "traffic_stats.h"
 #include "rule_manager.h"
+#include "thread_safe_queue.h"
 #include <iostream>
 #include <vector>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+namespace {
+
+constexpr int NUM_WORKER_THREADS = 3;
+
+// One item of work handed from the reader thread to a worker thread.
+struct WorkItem {
+    RawPacket packet;
+    int packet_number;
+};
+
+// Everything a worker thread touches that's SHARED across threads.
+// Anything not in here (like a local ParsedPacket) is safely private
+// to each worker's own stack -- no locking needed for those.
+struct SharedState {
+    RuleManager rules;
+    TrafficStats stats;
+    std::mutex stats_mutex;   // protects rules + stats from concurrent access
+    std::mutex print_mutex;   // protects std::cout so lines don't interleave
+    std::atomic<int> blocked_total{0};
+};
+
+void workerLoop(ThreadSafeQueue<WorkItem>& queue, SharedState& shared) {
+    WorkItem item;
+    while (queue.waitAndPop(item)) {
+        // --- Parsing is CPU work with no shared state -- runs freely
+        // in parallel across all worker threads, no lock needed. ---
+        ParsedPacket parsed = PacketParser::parse(item.packet.data);
+
+        std::string sni;
+        if (parsed.has_tcp && parsed.payload_offset < item.packet.data.size()) {
+            std::vector<uint8_t> payload(
+                item.packet.data.begin() + parsed.payload_offset,
+                item.packet.data.end()
+            );
+            sni = SniExtractor::extract(payload);
+        }
+
+        if (!parsed.has_ip) continue;
+
+        // --- From here on we touch SHARED state (rules + stats) ---
+        // so this section must be protected by a mutex.
+        bool blocked = false;
+        {
+            std::lock_guard<std::mutex> lock(shared.stats_mutex);
+            blocked = shared.rules.shouldBlock(parsed.ip.dst_ip, sni);
+            if (!blocked) {
+                shared.stats.recordPacket(parsed.ip.dst_ip, parsed.ip.protocol, sni);
+            }
+        }
+        if (blocked) {
+            shared.blocked_total++; // std::atomic -- safe without a mutex
+        }
+
+        // --- Printing also needs its own lock, otherwise output from
+        // different threads can interleave mid-line and look garbled. ---
+        {
+            std::lock_guard<std::mutex> lock(shared.print_mutex);
+            std::cout << "--- Packet #" << item.packet_number
+                       << " (" << item.packet.captured_len << " bytes) ---\n";
+            if (parsed.has_ip) {
+                std::cout << "  IP: " << PacketParser::ipToString(parsed.ip.src_ip)
+                           << " -> " << PacketParser::ipToString(parsed.ip.dst_ip) << "\n";
+            }
+            if (!sni.empty()) {
+                std::cout << "  TLS SNI: " << sni << (blocked ? "  >>> BLOCKED <<<" : "") << "\n";
+            }
+        }
+    }
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -14,13 +90,12 @@ int main(int argc, char* argv[]) {
     }
 
     std::string pcap_path = argv[1];
-    RuleManager rules;
+    SharedState shared;
 
-    // Parse simple --block-domain flags, can be repeated.
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--block-domain" && i + 1 < argc) {
-            rules.blockDomain(argv[i + 1]);
+            shared.rules.blockDomain(argv[i + 1]);
             std::cout << "[Rule] Blocking domain: " << argv[i + 1] << "\n";
             i++;
         }
@@ -31,54 +106,35 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    TrafficStats stats;
+    ThreadSafeQueue<WorkItem> queue;
+
+    // Start the worker pool BEFORE we begin reading, so they're ready
+    // to start pulling work as soon as the first packet is pushed.
+    std::vector<std::thread> workers;
+    for (int i = 0; i < NUM_WORKER_THREADS; i++) {
+        workers.emplace_back(workerLoop, std::ref(queue), std::ref(shared));
+    }
+
+    // Main thread acts as the sole producer: read packets, push to queue.
     RawPacket packet;
     int count = 0;
-
     while (reader.readNextPacket(packet)) {
         count++;
-        ParsedPacket parsed = PacketParser::parse(packet.data);
+        queue.push(WorkItem{std::move(packet), count});
+    }
 
-        std::string sni;
-        if (parsed.has_tcp && parsed.payload_offset < packet.data.size()) {
-            std::vector<uint8_t> payload(
-                packet.data.begin() + parsed.payload_offset,
-                packet.data.end()
-            );
-            sni = SniExtractor::extract(payload);
-        }
+    // No more packets coming -- wake up any workers still waiting so
+    // they can see the queue is empty + shut down and exit their loop.
+    queue.shutdown();
 
-        std::cout << "--- Packet #" << count << " (" << packet.captured_len << " bytes) ---\n";
-
-        if (parsed.has_ip) {
-            std::cout << "  IP: " << PacketParser::ipToString(parsed.ip.src_ip)
-                      << " -> " << PacketParser::ipToString(parsed.ip.dst_ip)
-                      << "  protocol=" << static_cast<int>(parsed.ip.protocol) << "\n";
-        }
-        if (parsed.has_tcp) {
-            std::cout << "  TCP: port " << parsed.tcp.src_port
-                      << " -> port " << parsed.tcp.dst_port << "\n";
-            if (!sni.empty()) {
-                std::cout << "  TLS SNI (domain): " << sni << "\n";
-            }
-        }
-
-        if (!parsed.has_ip) {
-            continue; // nothing to block/record without an IP layer
-        }
-
-        // Check blocking BEFORE recording stats, so blocked traffic
-        // never leaks into the "allowed traffic" summary counts.
-        if (rules.shouldBlock(parsed.ip.dst_ip, sni)) {
-            std::cout << "  >>> BLOCKED (rule match) <<<\n";
-            continue; // skip recordPacket entirely for blocked traffic
-        }
-
-        stats.recordPacket(parsed.ip.dst_ip, parsed.ip.protocol, sni);
+    // Wait for every worker to finish processing what's left in the
+    // queue and exit cleanly before we print the final summary.
+    for (auto& t : workers) {
+        t.join();
     }
 
     std::cout << "\nTotal packets read: " << count << "\n";
-    std::cout << "Packets blocked: " << rules.blockedCount() << "\n";
-    stats.printSummary();
+    std::cout << "Packets blocked: " << shared.blocked_total.load() << "\n";
+    shared.stats.printSummary();
     return 0;
 }
