@@ -4,12 +4,14 @@
 #include "traffic_stats.h"
 #include "rule_manager.h"
 #include "thread_safe_queue.h"
+#include "pcap_writer.h"
 #include <iostream>
 #include <vector>
 #include <string>
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <memory>
 
 namespace {
 
@@ -30,6 +32,9 @@ struct SharedState {
     std::mutex stats_mutex;   // protects rules + stats from concurrent access
     std::mutex print_mutex;   // protects std::cout so lines don't interleave
     std::atomic<int> blocked_total{0};
+
+    std::unique_ptr<PcapWriter> output_writer; // null if --output wasn't given
+    std::mutex writer_mutex;                    // protects output_writer from concurrent writes
 };
 
 void workerLoop(ThreadSafeQueue<WorkItem>& queue, SharedState& shared) {
@@ -62,6 +67,9 @@ void workerLoop(ThreadSafeQueue<WorkItem>& queue, SharedState& shared) {
         }
         if (blocked) {
             shared.blocked_total++; // std::atomic -- safe without a mutex
+        } else if (shared.output_writer) {
+            std::lock_guard<std::mutex> lock(shared.writer_mutex);
+            shared.output_writer->writePacket(item.packet);
         }
 
         // --- Printing also needs its own lock, otherwise output from
@@ -97,6 +105,13 @@ int main(int argc, char* argv[]) {
         if (arg == "--block-domain" && i + 1 < argc) {
             shared.rules.blockDomain(argv[i + 1]);
             std::cout << "[Rule] Blocking domain: " << argv[i + 1] << "\n";
+            i++;
+        } else if (arg == "--output" && i + 1 < argc) {
+            shared.output_writer = std::make_unique<PcapWriter>();
+            if (!shared.output_writer->open(argv[i + 1])) {
+                return 1;
+            }
+            std::cout << "[Output] Writing allowed packets to: " << argv[i + 1] << "\n";
             i++;
         }
     }
